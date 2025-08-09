@@ -1,7 +1,7 @@
 GDDR7 Tester UI — Plain Text README
 
 简介
-本工具在本机浏览器里实时展示显存（GDDR6/GDDR7）带宽与抖动，帮助你在超频时快速找到“甜蜜点”。页面提供 Start / Stop / Restart 控制，并可配合 MSI Afterburner 一键切换显存频率档位。切换档位后，统计会自动清零，让新频率更快稳定。
+本工具在本机浏览器里实时展示显存（GDDR6/GDDR7）带宽与抖动，帮助你在超频时快速找到“甜蜜点”。页面提供 Start / Stop / Restart 控制，并可直接通过 NVAPI/NVML 调整显存频率，或配合 MSI Afterburner 一键切换显存档位。切换频率后统计会自动清零，让新频率更快稳定。
 
 主要功能
 
@@ -11,7 +11,7 @@ GDDR7 Tester UI — Plain Text README
 
 网页端按钮：开始、停止、重启测试器。
 
-可选的 MSI Afterburner 集成：一键应用 Profile 1–5，应用后清空统计窗口。
+支持 NVAPI/NVML 调用直接设置显存频率；也提供 MSI Afterburner 集成，可一键应用 Profile 1–5 并在应用后清空统计窗口。
 
 测试程序使用 128-bit 读写与 A↔B 图案翻转校验；所有访问模式都是全排列（无地址冲突），避免误报。
 
@@ -21,7 +21,7 @@ Windows 11 和最新版 NVIDIA 显卡驱动（已在 RTX 5070 / 5090 上验证�
 
 Python 3.10 或更高（仅用于本地网页 UI）
 
-可选：MSI Afterburner，事先把 Profile 1–5 配好显存频率
+可选：安装 `pynvml`（使用 NVAPI/NVML 直接调节显存）或 MSI Afterburner（需预先配置 Profile 1–5）
 
 快速开始（推荐）
 
@@ -41,7 +41,7 @@ http://127.0.0.1:8000
 
 使用 Start / Stop / Restart 控制测试器
 
-通过滑块选择 Afterburner 档位并点击“应用”（成功后统计清零）
+通过滑块设置显存频率偏移或选择 Afterburner 档位并点击“应用”（成功后统计清零）
 
 观察同一模式的 σ 和总体 σ̄；若 σ 明显增大或出现 New errors，则频率不稳
 
@@ -61,7 +61,7 @@ Mode 5: permute（乘法置换）
 
 UI 为每个模式维护独立的滚动窗口，计算各自 σ；同步显示平均 σ̄。
 
-应用新的 Afterburner Profile 后，后台会清空统计窗口，以便新的频率快速收敛。
+应用新的频率（NVAPI 或 Afterburner）后，后台会清空统计窗口，以便新的频率快速收敛。
 
 从源码构建（可选）
 普通构建（目标机需要 CUDA 运行时 DLL）：

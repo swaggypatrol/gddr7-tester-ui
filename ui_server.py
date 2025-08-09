@@ -12,18 +12,27 @@ CHUNK_ITERS   = 100           # 每组迭代
 RING_SIZE     = 800           # 前端保留多少个点
 ROLLING_WINDOW = 60           # 计算σ的滚动窗口长度（每个Mode各自维护）
 
+# --- 显存频率控制：优先尝试 NVAPI/NVML，无则回退到 Afterburner ---
+try:
+    from nvapi_control import NvAPI
+    nvapi = NvAPI()
+except Exception:
+    nvapi = None
+
 # Afterburner Profile 模式：滑块 0..4 -> Profile1..5
-PROFILE_MODE = True
+PROFILE_MODE = nvapi is None
 AFTERBURNER_EXE = r"C:\Program Files (x86)\MSI Afterburner\MSIAfterburner.exe"
-PROFILE_MAP = {0:1, 1:2, 2:3, 3:4, 4:5}
+PROFILE_MAP = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 
-# 如果改用命令模板方式，把 PROFILE_MODE 设 False，并设置下面模板
+# 若无需 Afterburner，可设置显存偏移命令模板（例如 nvidiaInspector）
 SET_OFFSET_CMD_TEMPLATE: Optional[str] = None
-# 例：SET_OFFSET_CMD_TEMPLATE = r'"C:\Tools\nvidiaInspector.exe" -setMemoryClockOffset:0,0,{offset}'
 
-SLIDER_MIN  = 0
-SLIDER_MAX  = 4 if PROFILE_MODE else 2000
-SLIDER_STEP = 1 if PROFILE_MODE else 50
+if nvapi:
+    SLIDER_MIN, SLIDER_MAX, SLIDER_STEP = -500, 500, 25
+elif PROFILE_MODE:
+    SLIDER_MIN, SLIDER_MAX, SLIDER_STEP = 0, 4, 1
+else:
+    SLIDER_MIN, SLIDER_MAX, SLIDER_STEP = -2000, 2000, 50
 # ========================================================
 
 app = FastAPI()
@@ -205,31 +214,36 @@ def run_cmd(cmd: str):
 async def api_set_mem(req: Request):
     """应用 Profile / 偏移；成功后清空统计窗口（让新频率的σ立即独立）"""
     global mode_hist, history
+    data = await req.json()
+    if nvapi:
+        offset = int(data.get("offset", 0))
+        ok, msg = nvapi.set_mem_clock_offset(offset)
+        if ok:
+            mode_hist = {m: deque(maxlen=ROLLING_WINDOW) for m in range(1, 6)}
+            await broadcast({"type": "status", "text": f"Offset {offset} MHz applied; stats cleared"})
+        return JSONResponse({"ok": ok, "msg": msg})
     if PROFILE_MODE:
-        data = await req.json()
         level = int(data.get("level", 0))
         prof = PROFILE_MAP.get(level)
         if prof is None:
-            return JSONResponse({"ok":False,"msg":f"level {level} not mapped"}, status_code=400)
+            return JSONResponse({"ok": False, "msg": f"level {level} not mapped"}, status_code=400)
         if not os.path.isfile(AFTERBURNER_EXE):
-            return JSONResponse({"ok":False,"msg":f"Afterburner not found: {AFTERBURNER_EXE}"}, status_code=400)
+            return JSONResponse({"ok": False, "msg": f"Afterburner not found: {AFTERBURNER_EXE}"}, status_code=400)
         cmd = f'"{AFTERBURNER_EXE}" -Profile{prof}'
         ok, out = run_cmd(cmd)
         if ok:
             mode_hist = {m: deque(maxlen=ROLLING_WINDOW) for m in range(1, 6)}  # 清零σ窗口
-            await broadcast({"type":"status","text":f"Profile{prof} applied; stats cleared"})
-        return JSONResponse({"ok":ok,"cmd":cmd,"out":out})
-    else:
-        if not SET_OFFSET_CMD_TEMPLATE:
-            return JSONResponse({"ok":False,"msg":"SET_OFFSET_CMD_TEMPLATE not configured"}, status_code=400)
-        data = await req.json()
-        offset = int(data.get("offset", 0))
-        cmd = SET_OFFSET_CMD_TEMPLATE.format(offset=offset)
-        ok, out = run_cmd(cmd)
-        if ok:
-            mode_hist = {m: deque(maxlen=ROLLING_WINDOW) for m in range(1, 6)}
-            await broadcast({"type":"status","text":f"Offset {offset} applied; stats cleared"})
-        return JSONResponse({"ok":ok,"cmd":cmd,"out":out})
+            await broadcast({"type": "status", "text": f"Profile{prof} applied; stats cleared"})
+        return JSONResponse({"ok": ok, "cmd": cmd, "out": out})
+    if not SET_OFFSET_CMD_TEMPLATE:
+        return JSONResponse({"ok": False, "msg": "SET_OFFSET_CMD_TEMPLATE not configured"}, status_code=400)
+    offset = int(data.get("offset", 0))
+    cmd = SET_OFFSET_CMD_TEMPLATE.format(offset=offset)
+    ok, out = run_cmd(cmd)
+    if ok:
+        mode_hist = {m: deque(maxlen=ROLLING_WINDOW) for m in range(1, 6)}
+        await broadcast({"type": "status", "text": f"Offset {offset} applied; stats cleared"})
+    return JSONResponse({"ok": ok, "cmd": cmd, "out": out})
 
 # ------------------- 纯字符串 HTML（避免 f-string 与 {{}} 冲突） -------------------
 INDEX_HTML = """
@@ -285,7 +299,7 @@ INDEX_HTML = """
     <div><span class="label">占用比例</span> <input id="fraction" type="number" min="0.1" max="0.9" step="0.05"></div>
     <div style="margin-top:8px"><span class="label">每组迭代</span> <input id="iters" type="number" min="10" max="1000" step="10"></div>
     <hr/>
-    <div><span class="label">显存频率滑块</span>（需 Afterburner）</div>
+    <div><span class="label">显存频率滑块</span></div>
     <input id="memSlider" type="range">
     <div class="muted" id="sliderLabel"></div>
     <div style="margin-top:8px"><button id="btnApply">应用</button> <span id="applyMsg" class="muted"></span></div>
@@ -336,7 +350,8 @@ document.getElementById('fraction').value = CFG.FRACTION.toFixed(2);
 document.getElementById('iters').value = CFG.CHUNK_ITERS;
 const slider=document.getElementById('memSlider'), label=document.getElementById('sliderLabel');
 slider.min = CFG.SLIDER_MIN; slider.max = CFG.SLIDER_MAX; slider.step = CFG.SLIDER_STEP; slider.value = CFG.SLIDER_MIN;
-function refreshLabel(){ label.innerText = '档位: ' + slider.value; } refreshLabel(); slider.oninput=refreshLabel;
+function refreshLabel(){ label.innerText = (CFG.PROFILE_MODE?'档位: ':'偏移: ') + slider.value + (CFG.PROFILE_MODE?'':' MHz'); }
+refreshLabel(); slider.oninput=refreshLabel;
 
 // 控制按钮
 document.getElementById('btnStart').onclick=async()=>{
@@ -356,11 +371,12 @@ document.getElementById('btnRestart').onclick=async()=>{
   const j=await r.json();document.getElementById('status').innerText=j.msg||'';
 };
 
-// 应用 Afterburner 档位（后端会清空统计）
+// 应用显存频率调整（后端会清空统计）
 document.getElementById('btnApply').onclick=async()=>{
-  const payload={level:parseInt(slider.value)};
+  const payload = CFG.PROFILE_MODE ? {level:parseInt(slider.value)} : {offset:parseInt(slider.value)};
   const r=await fetch('/api/set_mem',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-  const j=await r.json();document.getElementById('applyMsg').innerText=j.ok?('Applied: '+(j.cmd||'')):('Failed: '+(j.msg||'')); 
+  const j=await r.json();
+  document.getElementById('applyMsg').innerText = j.ok ? ('Applied: '+ (j.cmd||j.msg||'')) : ('Failed: '+ (j.msg||''));
 };
 </script>
 </body></html>
@@ -375,6 +391,7 @@ async def index():
         "SLIDER_MIN": SLIDER_MIN,
         "SLIDER_MAX": SLIDER_MAX,
         "SLIDER_STEP": SLIDER_STEP,
+        "PROFILE_MODE": PROFILE_MODE,
     }
     html = INDEX_HTML.replace("__CFG_JSON__", json.dumps(cfg))
     return HTMLResponse(html)
