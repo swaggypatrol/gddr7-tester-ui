@@ -5,33 +5,42 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-# ================ 固定路径与参数（按需改） ================
+# ================ Fixed paths and parameters (adjust as needed) ================
 TESTER_PATH   = r"C:\gddr7_tester\gddr7_tester.exe"
-FRACTION      = 0.80          # 默认占用比例
-CHUNK_ITERS   = 100           # 每组迭代
-RING_SIZE     = 800           # 前端保留多少个点
-ROLLING_WINDOW = 60           # 计算σ的滚动窗口长度（每个Mode各自维护）
+FRACTION      = 0.80          # default memory fraction
+CHUNK_ITERS   = 100           # iterations per chunk
+RING_SIZE     = 800           # how many points the frontend keeps
+ROLLING_WINDOW = 60           # window length for σ per mode
 
-# Afterburner Profile 模式：滑块 0..4 -> Profile1..5
-PROFILE_MODE = True
+# --- Memory clock control: prefer NVAPI/NVML, fall back to Afterburner ---
+try:
+    from nvapi_control import NvAPI
+    nvapi = NvAPI()
+except Exception:
+    nvapi = None
+
+# Afterburner profile mode: slider 0..4 -> Profile1..5
+PROFILE_MODE = nvapi is None
 AFTERBURNER_EXE = r"C:\Program Files (x86)\MSI Afterburner\MSIAfterburner.exe"
-PROFILE_MAP = {0:1, 1:2, 2:3, 3:4, 4:5}
+PROFILES = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 
-# 如果改用命令模板方式，把 PROFILE_MODE 设 False，并设置下面模板
+# For other tools (e.g. nvidiaInspector) provide a command template for offsets
 SET_OFFSET_CMD_TEMPLATE: Optional[str] = None
-# 例：SET_OFFSET_CMD_TEMPLATE = r'"C:\Tools\nvidiaInspector.exe" -setMemoryClockOffset:0,0,{offset}'
 
-SLIDER_MIN  = 0
-SLIDER_MAX  = 4 if PROFILE_MODE else 2000
-SLIDER_STEP = 1 if PROFILE_MODE else 50
+if nvapi:
+    SLIDER_MIN, SLIDER_MAX, SLIDER_STEP = -500, 500, 25
+elif PROFILE_MODE:
+    SLIDER_MIN, SLIDER_MAX, SLIDER_STEP = 0, 4, 1
+else:
+    SLIDER_MIN, SLIDER_MAX, SLIDER_STEP = -2000, 2000, 50
 # ========================================================
 
 app = FastAPI()
 clients: List[WebSocket] = []
 proc: Optional[asyncio.subprocess.Process] = None
-RUN_ENABLED = True  # 是否运行测试器（Stop/Start 会改它）
+RUN_ENABLED = True  # whether the tester should run (toggled by Stop/Start)
 
-# 解析 tester 输出（含 Mode）
+# Parse tester output (includes Mode)
 LINE_RE = re.compile(
     r"\[Chunk\s+(\d+)\s*\|\s*Mode\s+(\d+)\]\s+Time:\s+([\d\.]+)\s+ms\s+\|\s+Bandwidth:\s+([\d\.]+)\s+GB/s\s+\|\s+New errors:\s+(\d+)\s+\|\s+Total errors:\s+(\d+)"
 )
@@ -39,7 +48,7 @@ LINE_RE = re.compile(
 Point = Tuple[int,int,float,float,int,int]  # (chunk, mode, ms, gbps, new_err, total_err)
 history: Deque[Point] = deque(maxlen=RING_SIZE)
 
-# 每个 Mode 独立窗口，计算“组内抖动”
+# Each mode maintains its own window to compute per-mode jitter
 mode_hist = {m: deque(maxlen=ROLLING_WINDOW) for m in range(1, 6)}
 
 def std_of(seq):
@@ -60,7 +69,7 @@ async def broadcast(msg: dict):
         except ValueError: pass
 
 async def runner_loop():
-    """根据 RUN_ENABLED 状态管理 tester 进程，并把输出行推给前端"""
+    """Manage the tester process according to RUN_ENABLED and stream output"""
     global proc, history, mode_hist
     while True:
         if not RUN_ENABLED:
@@ -95,17 +104,17 @@ async def runner_loop():
                     newe  = int(m.group(5))
                     tote  = int(m.group(6))
 
-                    # 组内窗口 + 统计
+                    # per-mode window and statistics
                     buf = mode_hist.get(mode)
                     if buf is not None:
                         buf.append(gbps)
                     per_mode_std = {str(k): std_of(v) for k, v in mode_hist.items() if len(v) > 1}
                     avg_std = (sum(per_mode_std.values()) / len(per_mode_std)) if per_mode_std else 0.0
 
-                    # 保存历史点
+                    # store history
                     history.append((chunk, mode, ms, gbps, newe, tote))
 
-                    # 推送给前端
+                    # forward to clients
                     await broadcast({
                         "type":"point",
                         "chunk":chunk, "mode":mode, "ms":ms, "gbps":gbps,
@@ -115,7 +124,7 @@ async def runner_loop():
                 elif "CUDA error" in text:
                     await broadcast({"type":"status","error":text})
         finally:
-            # 结束当前进程
+            # terminate current process
             if proc and proc.returncode is None:
                 try: proc.terminate()
                 except ProcessLookupError: pass
@@ -135,7 +144,7 @@ async def _startup():
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     clients.append(ws)
-    # 初始回放历史点（σ用当前窗口的统计）
+    # Replay history on connect (σ uses current windows)
     per_mode_std = {str(k): std_of(v) for k, v in mode_hist.items() if len(v) > 1}
     avg_std = (sum(per_mode_std.values()) / len(per_mode_std)) if per_mode_std else 0.0
     for (chunk, mode, ms, gbps, newe, tote) in list(history):
@@ -150,11 +159,11 @@ async def ws_endpoint(ws: WebSocket):
         try: clients.remove(ws)
         except ValueError: pass
 
-# -------- 控制接口：Start / Stop / Restart / SetMem --------
+# -------- Control endpoints: Start / Stop / Restart / SetMem --------
 
 @app.post("/api/start")
 async def api_start(req: Request):
-    """开始：若已在跑则不动；可携带 fraction/iters 覆盖"""
+    """Start tester; ignore if already running. Allows fraction/iters override."""
     global RUN_ENABLED, FRACTION, CHUNK_ITERS
     data = await req.json()
     try:
@@ -168,7 +177,7 @@ async def api_start(req: Request):
 
 @app.post("/api/stop")
 async def api_stop():
-    """停止：终止当前进程，并禁止自动重启"""
+    """Stop tester and prevent auto-restart"""
     global RUN_ENABLED, proc
     RUN_ENABLED = False
     if proc and proc.returncode is None:
@@ -178,7 +187,7 @@ async def api_stop():
 
 @app.post("/api/restart")
 async def api_restart(req: Request):
-    """重启：清空历史与窗口，立即重启"""
+    """Restart: clear history and windows, then start immediately"""
     global FRACTION, CHUNK_ITERS, proc, history, mode_hist, RUN_ENABLED
     data = await req.json()
     try:
@@ -203,35 +212,40 @@ def run_cmd(cmd: str):
 
 @app.post("/api/set_mem")
 async def api_set_mem(req: Request):
-    """应用 Profile / 偏移；成功后清空统计窗口（让新频率的σ立即独立）"""
+    """Apply profile or offset; on success clear stats so new frequency has fresh σ"""
     global mode_hist, history
+    data = await req.json()
+    if nvapi:
+        offset = int(data.get("offset", 0))
+        ok, msg = nvapi.set_mem_clock_offset(offset)
+        if ok:
+            mode_hist = {m: deque(maxlen=ROLLING_WINDOW) for m in range(1, 6)}
+            await broadcast({"type": "status", "text": f"Offset {offset} MHz applied; stats cleared"})
+        return JSONResponse({"ok": ok, "msg": msg})
     if PROFILE_MODE:
-        data = await req.json()
         level = int(data.get("level", 0))
-        prof = PROFILE_MAP.get(level)
+        prof = PROFILES.get(level)
         if prof is None:
-            return JSONResponse({"ok":False,"msg":f"level {level} not mapped"}, status_code=400)
+            return JSONResponse({"ok": False, "msg": f"level {level} not mapped"}, status_code=400)
         if not os.path.isfile(AFTERBURNER_EXE):
-            return JSONResponse({"ok":False,"msg":f"Afterburner not found: {AFTERBURNER_EXE}"}, status_code=400)
+            return JSONResponse({"ok": False, "msg": f"Afterburner not found: {AFTERBURNER_EXE}"}, status_code=400)
         cmd = f'"{AFTERBURNER_EXE}" -Profile{prof}'
         ok, out = run_cmd(cmd)
         if ok:
-            mode_hist = {m: deque(maxlen=ROLLING_WINDOW) for m in range(1, 6)}  # 清零σ窗口
-            await broadcast({"type":"status","text":f"Profile{prof} applied; stats cleared"})
-        return JSONResponse({"ok":ok,"cmd":cmd,"out":out})
-    else:
-        if not SET_OFFSET_CMD_TEMPLATE:
-            return JSONResponse({"ok":False,"msg":"SET_OFFSET_CMD_TEMPLATE not configured"}, status_code=400)
-        data = await req.json()
-        offset = int(data.get("offset", 0))
-        cmd = SET_OFFSET_CMD_TEMPLATE.format(offset=offset)
-        ok, out = run_cmd(cmd)
-        if ok:
-            mode_hist = {m: deque(maxlen=ROLLING_WINDOW) for m in range(1, 6)}
-            await broadcast({"type":"status","text":f"Offset {offset} applied; stats cleared"})
-        return JSONResponse({"ok":ok,"cmd":cmd,"out":out})
+            mode_hist = {m: deque(maxlen=ROLLING_WINDOW) for m in range(1, 6)}  # reset σ window
+            await broadcast({"type": "status", "text": f"Profile{prof} applied; stats cleared"})
+        return JSONResponse({"ok": ok, "cmd": cmd, "out": out})
+    if not SET_OFFSET_CMD_TEMPLATE:
+        return JSONResponse({"ok": False, "msg": "SET_OFFSET_CMD_TEMPLATE not configured"}, status_code=400)
+    offset = int(data.get("offset", 0))
+    cmd = SET_OFFSET_CMD_TEMPLATE.format(offset=offset)
+    ok, out = run_cmd(cmd)
+    if ok:
+        mode_hist = {m: deque(maxlen=ROLLING_WINDOW) for m in range(1, 6)}
+        await broadcast({"type": "status", "text": f"Offset {offset} applied; stats cleared"})
+    return JSONResponse({"ok": ok, "cmd": cmd, "out": out})
 
-# ------------------- 纯字符串 HTML（避免 f-string 与 {{}} 冲突） -------------------
+# ------------------- Raw HTML string (avoid f-string and {{}} conflicts) -------------------
 INDEX_HTML = """
 <!doctype html><html><head>
 <meta charset="utf-8"/><title>GDDR7 Live Monitor</title>
@@ -267,28 +281,28 @@ INDEX_HTML = """
   </div>
   <div class="card" style="max-width:420px">
     <div style="margin-bottom:8px">
-      <span class="pill" id="btnStart">开始</span>
-      <span class="pill" id="btnStop">停止</span>
-      <span class="pill" id="btnRestart">重启</span>
+      <span class="pill" id="btnStart">Start</span>
+      <span class="pill" id="btnStop">Stop</span>
+      <span class="pill" id="btnRestart">Restart</span>
       <span id="status" class="muted" style="margin-left:8px"></span>
     </div>
-    <div><span class="label">当前带宽：</span><span id="bw">--</span> GB/s</div>
-    <div><span class="label">总错误：</span><span id="errs">0</span></div>
+    <div><span class="label">Current bandwidth:</span><span id="bw">--</span> GB/s</div>
+    <div><span class="label">Total errors:</span><span id="errs">0</span></div>
     <div style="margin-top:6px">
-      <span class="label">抖动(σ)：</span>
+      <span class="label">Jitter (σ):</span>
       <div class="muted" id="sigmaTable">
         <div>Mode1: <span id="s1">--</span> | Mode2: <span id="s2">--</span> | Mode3: <span id="s3">--</span></div>
-        <div>Mode4: <span id="s4">--</span> | Mode5: <span id="s5">--</span> | 平均σ̄: <span id="savg">--</span></div>
+        <div>Mode4: <span id="s4">--</span> | Mode5: <span id="s5">--</span> | Avg σ̄: <span id="savg">--</span></div>
       </div>
     </div>
     <hr/>
-    <div><span class="label">占用比例</span> <input id="fraction" type="number" min="0.1" max="0.9" step="0.05"></div>
-    <div style="margin-top:8px"><span class="label">每组迭代</span> <input id="iters" type="number" min="10" max="1000" step="10"></div>
+    <div><span class="label">Memory fraction</span> <input id="fraction" type="number" min="0.1" max="0.9" step="0.05"></div>
+    <div style="margin-top:8px"><span class="label">Iterations per chunk</span> <input id="iters" type="number" min="10" max="1000" step="10"></div>
     <hr/>
-    <div><span class="label">显存频率滑块</span>（需 Afterburner）</div>
+    <div><span class="label">Memory clock slider</span></div>
     <input id="memSlider" type="range">
     <div class="muted" id="sliderLabel"></div>
-    <div style="margin-top:8px"><button id="btnApply">应用</button> <span id="applyMsg" class="muted"></span></div>
+    <div style="margin-top:8px"><button id="btnApply">Apply</button> <span id="applyMsg" class="muted"></span></div>
   </div>
 </div>
 <script>
@@ -331,14 +345,15 @@ ws.onmessage=(ev)=>{
   }
 };
 
-// 初始化控件默认值
+// Initialize control defaults
 document.getElementById('fraction').value = CFG.FRACTION.toFixed(2);
 document.getElementById('iters').value = CFG.CHUNK_ITERS;
 const slider=document.getElementById('memSlider'), label=document.getElementById('sliderLabel');
 slider.min = CFG.SLIDER_MIN; slider.max = CFG.SLIDER_MAX; slider.step = CFG.SLIDER_STEP; slider.value = CFG.SLIDER_MIN;
-function refreshLabel(){ label.innerText = '档位: ' + slider.value; } refreshLabel(); slider.oninput=refreshLabel;
+function refreshLabel(){ label.innerText = (CFG.PROFILE_MODE?'Profile: ':'Offset: ') + slider.value + (CFG.PROFILE_MODE?'':' MHz'); }
+refreshLabel(); slider.oninput=refreshLabel;
 
-// 控制按钮
+// Control buttons
 document.getElementById('btnStart').onclick=async()=>{
   const f=parseFloat(document.getElementById('fraction').value||CFG.FRACTION);
   const it=parseInt(document.getElementById('iters').value||CFG.CHUNK_ITERS);
@@ -356,11 +371,12 @@ document.getElementById('btnRestart').onclick=async()=>{
   const j=await r.json();document.getElementById('status').innerText=j.msg||'';
 };
 
-// 应用 Afterburner 档位（后端会清空统计）
+// Apply memory clock change (backend clears stats)
 document.getElementById('btnApply').onclick=async()=>{
-  const payload={level:parseInt(slider.value)};
+  const payload = CFG.PROFILE_MODE ? {level:parseInt(slider.value)} : {offset:parseInt(slider.value)};
   const r=await fetch('/api/set_mem',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-  const j=await r.json();document.getElementById('applyMsg').innerText=j.ok?('Applied: '+(j.cmd||'')):('Failed: '+(j.msg||'')); 
+  const j=await r.json();
+  document.getElementById('applyMsg').innerText = j.ok ? ('Applied: '+ (j.cmd||j.msg||'')) : ('Failed: '+ (j.msg||''));
 };
 </script>
 </body></html>
@@ -375,6 +391,7 @@ async def index():
         "SLIDER_MIN": SLIDER_MIN,
         "SLIDER_MAX": SLIDER_MAX,
         "SLIDER_STEP": SLIDER_STEP,
+        "PROFILE_MODE": PROFILE_MODE,
     }
     html = INDEX_HTML.replace("__CFG_JSON__", json.dumps(cfg))
     return HTMLResponse(html)

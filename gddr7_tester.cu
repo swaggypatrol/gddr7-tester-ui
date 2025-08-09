@@ -22,44 +22,44 @@ __device__ __forceinline__ uint32_t mix32(uint64_t x) {
   return static_cast<uint32_t>(x ^ (x >> 32));
 }
 
-// ====== 访问顺序映射（保证是全排列） ======
+// ====== Access order mapping (ensures a permutation) ======
 struct MapParams {
-  unsigned long long step2; // stride-64KiB 的步长（与 n_vec 互素）
-  unsigned long long step3; // stride-128KiB 的步长（与 n_vec 互素）
-  unsigned long long step5; // 乘法置换步长（与 n_vec 互素）
-  unsigned int block;       // block-xor 的块大小（单位：uint4 lane），建议 256 (4KiB)
+  unsigned long long step2; // stride-64KiB step (coprime with n_vec)
+  unsigned long long step3; // stride-128KiB step (coprime with n_vec)
+  unsigned long long step5; // multiplicative permutation step (coprime with n_vec)
+  unsigned int block;       // block-xor size in uint4 lanes, recommend 256 (4KiB)
 };
 
 __device__ __forceinline__
 size_t map_index_perm(size_t i, size_t n_vec, int mode, const MapParams p)
 {
   if (mode == 1) {
-    // 线性：自然顺序
+    // linear: natural order
     return i;
   } else if (mode == 2) {
-    // stride ~64KiB：m = i * step (mod n)；step 与 n 互素 => 全排列
+    // stride ~64KiB: m = i * step (mod n); step coprime with n => permutation
     return (i * p.step2) % n_vec;
   } else if (mode == 3) {
     // stride ~128KiB
     return (i * p.step3) % n_vec;
   } else if (mode == 4) {
-    // block-xor(4KiB)：完整块内做位翻转；尾块（不足一个块）用身份映射，避免冲突
+    // block-xor (4KiB): flip bits within full blocks; tail blocks use identity mapping
     const unsigned long long B = p.block;
-    unsigned long long full = (n_vec / B) * B;  // 完整块覆盖范围
+    unsigned long long full = (n_vec / B) * B;  // coverage of full blocks
     if (i < full) {
       unsigned long long g = i / B, r = i % B;
-      unsigned long long r2 = r ^ (B >> 1);     // 翻半块
+      unsigned long long r2 = r ^ (B >> 1);     // swap half-block
       return g * B + r2;
     } else {
-      return i; // 尾块：保持不变，保证一一映射
+      return i; // tail block: unchanged to preserve one-to-one mapping
     }
   } else {
-    // 乘法置换（近似随机）：与 n 互素的奇数 step5
+    // multiplicative permutation (pseudo-random): odd step5 coprime with n
     return (i * p.step5) % n_vec;
   }
 }
 
-// ====== 向量化核 ======
+// ====== Vectorized kernels ======
 __global__ void init_pattern_vec(uint4* __restrict__ data4, size_t n_vec, uint32_t seed) {
   size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   size_t stride = (size_t)blockDim.x * gridDim.x;
@@ -82,7 +82,7 @@ __global__ void verify_and_flip_vec(uint4* __restrict__ data4, size_t n_vec,
   size_t stride = (size_t)blockDim.x * gridDim.x;
 
   for (size_t i = tid; i < n_vec; i += stride) {
-    size_t m = map_index_perm(i, n_vec, mode, mp);  // 仅改变访问顺序，不改变“哪个地址存什么”
+    size_t m = map_index_perm(i, n_vec, mode, mp);  // only changes access order; data locations unchanged
     size_t base = m * 4ULL;
     uint4 v = data4[m];
 
@@ -105,7 +105,7 @@ __global__ void verify_and_flip_vec(uint4* __restrict__ data4, size_t n_vec,
   }
 }
 
-// ====== 主机侧：挑互素步长 ======
+// ====== Host: pick coprime steps ======
 static inline unsigned long long gcd_ull(unsigned long long a, unsigned long long b) {
   while (b) { unsigned long long t = a % b; a = b; b = t; }
   return a;
@@ -114,12 +114,12 @@ static inline unsigned long long gcd_ull(unsigned long long a, unsigned long lon
 static inline unsigned long long pick_coprime_step(unsigned long long n, unsigned long long target) {
   if (n <= 1) return 1;
   if (target == 0) target = 1;
-  // 让它是奇数，从 target 附近两边找与 n 互素的值
+  // force odd and search near target for a value coprime with n
   if ((target & 1ULL) == 0) target += 1;
   unsigned long long s = target, delta = 0;
   for (unsigned tries = 0; tries < 100000; ++tries) {
     if (gcd_ull(n, s) == 1ULL) return s;
-    // 交替 +2 / -2 往外扩
+    // alternate +2 / -2 while expanding outward
     delta += 2;
     unsigned long long up = s + delta;
     if (up > 1 && gcd_ull(n, up) == 1ULL) return up;
@@ -128,7 +128,7 @@ static inline unsigned long long pick_coprime_step(unsigned long long n, unsigne
       if (gcd_ull(n, dn) == 1ULL) return dn;
     }
   }
-  // 实在挑不到（极端情况），退化成 1
+  // fall back to 1 if no coprime found (extreme case)
   return 1ULL;
 }
 
@@ -151,7 +151,7 @@ int main(int argc, char* argv[]) {
 
   size_t targetB = (size_t)(freeB * fraction);
   size_t n_elems = targetB / sizeof(uint32_t);
-  n_elems -= (n_elems & 3ULL); // 16B 对齐
+  n_elems -= (n_elems & 3ULL); // align to 16B
   targetB  = n_elems * sizeof(uint32_t);
   size_t n_vec = n_elems / 4;
 
@@ -164,12 +164,12 @@ int main(int argc, char* argv[]) {
   printf("Allocated/Tested: %.2f GiB (fraction=%.2f)\n", toGiB(targetB), fraction);
   if (n_vec == 0) { printf("Nothing to test.\n"); return 0; }
 
-  // 选择“互素”的步长
+  // choose steps that are coprime with n
   MapParams mp{};
   mp.block = 256; // 4KiB per block (256 * 16B)
   mp.step2 = pick_coprime_step(n_vec, (64ULL * 1024) / 16ULL);   // ~64KiB / 16B
   mp.step3 = pick_coprime_step(n_vec, (128ULL * 1024) / 16ULL);  // ~128KiB / 16B
-  mp.step5 = pick_coprime_step(n_vec, 2654435761ULL);            // 乘法置换常量的互素近邻
+  mp.step5 = pick_coprime_step(n_vec, 2654435761ULL);            // coprime neighbor of permutation constant
   printf("Permutation steps: mode2=%llu, mode3=%llu, mode5=%llu (n_vec=%llu)\n",
          (unsigned long long)mp.step2, (unsigned long long)mp.step3, (unsigned long long)mp.step5,
          (unsigned long long)n_vec);
