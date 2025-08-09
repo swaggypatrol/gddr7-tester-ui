@@ -1,0 +1,23 @@
+Python
+pycache/
+*.pyc
+.venv/
+venv/
+
+OS
+.DS_Store
+Thumbs.db
+
+Build artifacts
+*.exe
+*.pdb
+*.obj
+*.dll
+*.exp
+*.lib
+build/
+dist/
+
+Editor
+.vscode/
+.idea/
